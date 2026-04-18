@@ -32,6 +32,17 @@ def test_tradovate_live_url():
     assert "live" in settings.base_url
 
 
+def test_tradovate_demo_md_url():
+    settings = TradovateSettings(demo=True)
+    assert "md-demo" in settings.md_url
+
+
+def test_tradovate_live_md_url():
+    settings = TradovateSettings(demo=False)
+    assert "md-demo" not in settings.md_url
+    assert "md.tradovateapi.com" in settings.md_url
+
+
 def test_bookmap_not_configured_nonexistent_dir():
     settings = BookmapSettings(export_dir=Path("/nonexistent"))
     assert not settings.is_configured

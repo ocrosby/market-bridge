@@ -52,6 +52,7 @@ def register_order_flow_tools(
                         "deltas": [d.to_dict() for d in deltas],
                         "cumulative_delta": last.cumulative_delta,
                         "net_bias": "bullish" if last.cumulative_delta > 0 else "bearish",
+                        "approximated": True,
                         "source": "tradovate",
                     }
                     cache.set(cache_key, result, ttl=15)

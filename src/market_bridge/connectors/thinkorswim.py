@@ -23,7 +23,7 @@ from datetime import datetime
 from pathlib import Path
 
 from market_bridge.config import ThinkorswimSettings
-from market_bridge.models import Bar, VolumeNode, VolumeProfile
+from market_bridge.models import Bar, VolumeNode, VolumeProfile, tick_size
 
 logger = logging.getLogger(__name__)
 
@@ -147,7 +147,7 @@ class ThinkorswimConnector:
             return VolumeProfile(symbol=symbol, session=session, lookback_days=lookback_days)
 
         # Build price -> volume map
-        tick = 0.25
+        tick = tick_size(symbol)
         price_vol: dict[float, int] = {}
         total_vol = 0
         for bar in bars:

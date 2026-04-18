@@ -13,9 +13,8 @@ from market_bridge.connectors.tradovate import (
     _bar_time_of_day_et,
     _compute_volume_profile,
     _filter_bars_by_session,
-    _tick_size,
 )
-from market_bridge.models import Bar
+from market_bridge.models import Bar, tick_size
 
 DEMO_URL = "https://demo.tradovateapi.com/v1"
 
@@ -296,29 +295,33 @@ class TestComputeLevels:
 
 class TestTickSize:
     def test_known_symbols(self):
-        assert _tick_size("/ES") == 0.25
-        assert _tick_size("/NQ") == 0.25
-        assert _tick_size("/YM") == 1.0
-        assert _tick_size("/CL") == 0.01
-        assert _tick_size("/ZN") == 1 / 64
-        assert _tick_size("/ZF") == 1 / 128
-        assert _tick_size("/6E") == 0.00005
-        assert _tick_size("/6J") == 0.0000005
+        assert tick_size("/ES") == 0.25
+        assert tick_size("/NQ") == 0.25
+        assert tick_size("/YM") == 1.0
+        assert tick_size("/CL") == 0.01
+        assert tick_size("/ZN") == 1 / 64
+        assert tick_size("/ZF") == 1 / 128
+        assert tick_size("/6E") == 0.00005
+        assert tick_size("/6J") == 0.0000005
 
     def test_unknown_defaults_to_025(self):
-        assert _tick_size("/UNKNOWN") == 0.25
+        assert tick_size("/UNKNOWN") == 0.25
 
 
 # ── Helper: bar time of day ──────────────────────────────────────────────
 
 
 class TestBarTimeOfDayET:
-    def test_utc_timestamp(self):
-        # 14:30 UTC = 10:30 ET (EDT, -4)
+    def test_utc_timestamp_edt(self):
+        # April (EDT): 14:30 UTC = 10:30 ET (-4)
         assert _bar_time_of_day_et("2026-04-18T14:30:00Z") == 10 * 60 + 30
 
+    def test_utc_timestamp_est(self):
+        # January (EST): 14:30 UTC = 09:30 ET (-5)
+        assert _bar_time_of_day_et("2026-01-15T14:30:00Z") == 9 * 60 + 30
+
     def test_midnight_utc(self):
-        # 00:00 UTC = 20:00 ET previous day
+        # April (EDT): 00:00 UTC = 20:00 ET previous day
         assert _bar_time_of_day_et("2026-04-18T00:00:00Z") == 20 * 60
 
     def test_invalid_returns_none(self):

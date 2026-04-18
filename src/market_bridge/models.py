@@ -165,6 +165,17 @@ class MarketStateInfo:
         }
 
 
+def tick_size(symbol: str) -> float:
+    """Get tick size for a futures symbol."""
+    tick_sizes = {
+        "/ES": 0.25, "/NQ": 0.25, "/YM": 1.0, "/RTY": 0.10,
+        "/CL": 0.01, "/GC": 0.10, "/SI": 0.005,
+        "/ZB": 1 / 32, "/ZN": 1 / 64, "/ZF": 1 / 128,
+        "/6E": 0.00005, "/6J": 0.0000005,
+    }
+    return tick_sizes.get(symbol, 0.25)
+
+
 # Futures contract specifications for session times
 FUTURES_SESSIONS: dict[str, dict] = {
     "/ES": {

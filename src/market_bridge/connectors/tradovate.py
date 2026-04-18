@@ -15,13 +15,24 @@ import time
 from datetime import datetime, timezone
 
 import httpx
+import pytz
 import websockets
 from websockets.asyncio.client import ClientConnection
 
 from market_bridge.config import TradovateSettings
-from market_bridge.models import FUTURES_SESSIONS, Bar, DeltaBar, HeatmapLevel, Levels, VolumeNode
+from market_bridge.models import (
+    FUTURES_SESSIONS,
+    Bar,
+    DeltaBar,
+    HeatmapLevel,
+    Levels,
+    VolumeNode,
+    tick_size,
+)
 
 logger = logging.getLogger(__name__)
+
+_ET = pytz.timezone("US/Eastern")
 
 # Map user-friendly timeframes to Tradovate chart descriptions
 TIMEFRAME_MAP: dict[str, dict] = {
@@ -129,6 +140,7 @@ class TradovateConnector:
             self.access_token = data.get("accessToken", self.access_token)
             self.token_expiry = time.monotonic() + 70 * 60
         else:
+            logger.warning("Token renewal failed (HTTP %s), re-authenticating", resp.status_code)
             await self.authenticate()
 
     async def _api_get(self, path: str, params: dict | None = None) -> dict | list:
@@ -161,15 +173,19 @@ class TradovateConnector:
         await self._ws_connect()
 
     async def _ws_connect(self) -> None:
+        ws = None
         try:
-            self._ws = await websockets.connect(self.settings.md_url)
+            ws = await websockets.connect(self.settings.md_url)
             # Authorize the WebSocket connection
-            await self._ws.send(f"authorize\n{self._next_id()}\n\n{self.access_token}")
-            auth_response = await self._ws.recv()
+            await ws.send(f"authorize\n{self._next_id()}\n\n{self.access_token}")
+            auth_response = await ws.recv()
             logger.info("Market data WebSocket connected: %s", str(auth_response)[:100])
+            self._ws = ws
             self._reconnect_attempts = 0
             self._ws_listener_task = asyncio.create_task(self._ws_listen())
         except Exception as e:
+            if ws is not None:
+                await ws.close()
             logger.error("WebSocket connection failed: %s", e)
             raise TradovateError(f"WebSocket connection failed: {e}") from e
 
@@ -182,9 +198,6 @@ class TradovateConnector:
             await self._ws_reconnect()
 
     def _handle_ws_message(self, message: str) -> None:
-        # Tradovate WebSocket responses are formatted as:
-        # a[<id>]\n<status>\n<body_json>
-        # or for subscriptions: d{"charts": [...]}
         if not message:
             return
 
@@ -208,21 +221,23 @@ class TradovateConnector:
                 logger.debug("Could not parse WebSocket message: %s", e)
 
     async def _ws_reconnect(self) -> None:
-        if self._reconnect_attempts >= self._max_reconnect_attempts:
-            logger.error("Max WebSocket reconnect attempts reached")
-            return
+        """Reconnect WebSocket with exponential backoff (iterative, bounded)."""
+        while self._reconnect_attempts < self._max_reconnect_attempts:
+            self._reconnect_attempts += 1
+            delay = self._reconnect_delay * (2 ** (self._reconnect_attempts - 1))
+            logger.info("Reconnecting WebSocket in %.1fs (attempt %d/%d)",
+                        delay, self._reconnect_attempts, self._max_reconnect_attempts)
+            await asyncio.sleep(delay)
 
-        self._reconnect_attempts += 1
-        delay = self._reconnect_delay * (2 ** (self._reconnect_attempts - 1))
-        logger.info("Reconnecting WebSocket in %.1fs (attempt %d)", delay, self._reconnect_attempts)
-        await asyncio.sleep(delay)
+            try:
+                await self._ensure_authenticated()
+                await self._ws_connect()
+                return  # success
+            except Exception as e:
+                logger.error("Reconnection attempt %d failed: %s", self._reconnect_attempts, e)
 
-        try:
-            await self._ensure_authenticated()
-            await self._ws_connect()
-        except Exception as e:
-            logger.error("Reconnection failed: %s", e)
-            await self._ws_reconnect()
+        logger.error("Max WebSocket reconnect attempts (%d) reached, giving up",
+                      self._max_reconnect_attempts)
 
     def _next_id(self) -> int:
         self._ws_counter += 1
@@ -233,7 +248,7 @@ class TradovateConnector:
             await self.connect_market_data()
 
         req_id = self._next_id()
-        future: asyncio.Future = asyncio.get_event_loop().create_future()
+        future: asyncio.Future = asyncio.get_running_loop().create_future()
         self._ws_responses[req_id] = future
 
         msg = f"{url}\n{req_id}\n\n{json.dumps(body)}"
@@ -285,6 +300,8 @@ class TradovateConnector:
                     close=float(b.get("close", 0)),
                     volume=int(b.get("volume", 0)),
                 ))
+        else:
+            logger.warning("Unexpected bar data structure from Tradovate: %s", type(raw_bars).__name__)
         return bars
 
     async def get_dom(self, symbol: str, depth: int = 10) -> dict:
@@ -292,7 +309,7 @@ class TradovateConnector:
         contract = await self.find_contract(symbol)
         contract_id = contract.get("id") or contract.get("contractId")
 
-        dom_data = await self._api_get(f"/md/dom", {"contractId": contract_id})
+        dom_data = await self._api_get("/md/dom", {"contractId": contract_id})
         bids = []
         asks = []
         if isinstance(dom_data, dict):
@@ -312,7 +329,7 @@ class TradovateConnector:
         """Fetch the latest quote for a symbol."""
         contract = await self.find_contract(symbol)
         contract_id = contract.get("id") or contract.get("contractId")
-        return await self._api_get(f"/md/quote", {"contractId": contract_id})
+        return await self._api_get("/md/quote", {"contractId": contract_id})
 
     # ── Derived data ─────────────────────────────────────────────────────
 
@@ -336,7 +353,7 @@ class TradovateConnector:
         session_low = min(lows) if lows else None
 
         # Compute volume profile from bars
-        vpoc, vah, val, hvns, lvns = _compute_volume_profile(session_bars)
+        vpoc, vah, val, hvns, lvns = _compute_volume_profile(session_bars, symbol)
 
         return Levels(
             symbol=symbol,
@@ -361,12 +378,14 @@ class TradovateConnector:
         bars = await self.get_bars(symbol, timeframe, count)
         deltas = []
         cumulative = 0
+        min_range = tick_size(symbol)
         for bar in bars:
+            bar_range = max(bar.high - bar.low, min_range)
             # Approximate: if close > open, more buying; if close < open, more selling
             if bar.close >= bar.open:
-                buy_pct = 0.5 + 0.5 * min((bar.close - bar.open) / max(bar.high - bar.low, 0.01), 1.0)
+                buy_pct = 0.5 + 0.5 * min((bar.close - bar.open) / bar_range, 1.0)
             else:
-                buy_pct = 0.5 - 0.5 * min((bar.open - bar.close) / max(bar.high - bar.low, 0.01), 1.0)
+                buy_pct = 0.5 - 0.5 * min((bar.open - bar.close) / bar_range, 1.0)
 
             buy_vol = int(bar.volume * buy_pct)
             sell_vol = bar.volume - buy_vol
@@ -392,11 +411,11 @@ class TradovateConnector:
         if not bars:
             return [], None, None, None
 
-        vpoc, vah, val, _, _ = _compute_volume_profile(bars)
+        vpoc, vah, val, _, _ = _compute_volume_profile(bars, symbol)
 
         # Build node list
         price_vol: dict[float, int] = {}
-        tick = _tick_size(symbol)
+        tick = tick_size(symbol)
         for bar in bars:
             rounded = round(round(bar.close / tick) * tick, 2)
             price_vol[rounded] = price_vol.get(rounded, 0) + bar.volume
@@ -418,13 +437,14 @@ class TradovateConnector:
 
 def _compute_volume_profile(
     bars: list[Bar],
+    symbol: str = "/ES",
 ) -> tuple[float | None, float | None, float | None, list[float], list[float]]:
     """Compute POC, VAH, VAL, HVNs, and LVNs from bar data."""
     if not bars:
         return None, None, None, [], []
 
     # Build price -> volume map using close prices binned to tick size
-    tick = 0.25  # default for /ES
+    tick = tick_size(symbol)
     price_vol: dict[float, int] = {}
     total_vol = 0
 
@@ -472,27 +492,10 @@ def _compute_volume_profile(
     return poc, vah, val, sorted(hvns), sorted(lvns)
 
 
-def _tick_size(symbol: str) -> float:
-    """Get tick size for a futures symbol."""
-    tick_sizes = {
-        "/ES": 0.25, "/NQ": 0.25, "/YM": 1.0, "/RTY": 0.10,
-        "/CL": 0.01, "/GC": 0.10, "/SI": 0.005,
-        "/ZB": 1 / 32, "/ZN": 1 / 64, "/ZF": 1 / 128,
-        "/6E": 0.00005, "/6J": 0.0000005,
-    }
-    return tick_sizes.get(symbol, 0.25)
-
-
 def _filter_bars_by_session(
     bars: list[Bar], symbol: str, session: str
 ) -> list[Bar]:
-    """Filter bars to only include those within the requested session window.
-
-    Args:
-        bars: List of bars with ISO timestamp strings.
-        symbol: Futures symbol (e.g. /ES) used to look up session times.
-        session: One of "rth", "globex", or "full".
-    """
+    """Filter bars to only include those within the requested session window."""
     if session == "full":
         return bars
 
@@ -523,15 +526,13 @@ def _filter_bars_by_session(
 def _bar_time_of_day_et(timestamp: str) -> int | None:
     """Extract time-of-day in minutes (ET) from an ISO timestamp string.
 
+    Uses pytz for correct EDT/EST conversion year-round.
     Returns None if the timestamp can't be parsed.
     """
     try:
-        # Tradovate timestamps are typically UTC ISO format
-        dt = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
-        # Convert UTC to ET (approximate: -4 for EDT, -5 for EST)
-        # Use -4 as EDT covers most trading days
-        et_hour = (dt.hour - 4) % 24
-        return et_hour * 60 + dt.minute
+        dt_utc = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+        dt_et = dt_utc.astimezone(_ET)
+        return dt_et.hour * 60 + dt_et.minute
     except (ValueError, AttributeError):
         return None
 

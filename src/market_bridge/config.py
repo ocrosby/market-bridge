@@ -28,7 +28,7 @@ class TradovateSettings(BaseSettings):
     @property
     def md_url(self) -> str:
         if self.demo:
-            return "wss://md.tradovateapi.com/v1/websocket"
+            return "wss://md-demo.tradovateapi.com/v1/websocket"
         return "wss://md.tradovateapi.com/v1/websocket"
 
     @property

@@ -96,7 +96,9 @@ class TestThinkorswimConnector:
             writer = csv.writer(f)
             writer.writerow(["datetime", "open", "high", "low", "close", "volume"])
             for i in range(20):
-                writer.writerow([f"2026-04-18 09:{30+i}", "5400", "5410", "5395", "5405", "1000"])
+                minute = 30 + i % 30
+                hour = 9 + (30 + i) // 60
+                writer.writerow([f"2026-04-18 {hour:02d}:{minute:02d}", "5400", "5410", "5395", "5405", "1000"])
 
         settings = ThinkorswimSettings(export_dir=tmp_path)
         connector = ThinkorswimConnector(settings)

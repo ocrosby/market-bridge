@@ -113,3 +113,39 @@ def test_next_session_change_present():
     state = _compute_at(10, 30)  # During RTH
     assert state.next_session_change is not None
     assert "RTH closes" in state.next_session_change
+
+
+def test_exactly_at_maintenance_start():
+    state = _compute_at(17, 0)  # Exactly at 17:00 ET (maintenance starts)
+    assert state.session == MarketSession.CLOSED
+    assert state.is_open is False
+
+
+def test_exactly_at_globex_reopen():
+    state = _compute_at(18, 0)  # Exactly at 18:00 ET (globex reopens)
+    assert state.session == MarketSession.GLOBEX
+    assert state.is_open is True
+
+
+def test_cl_rth_session():
+    """Crude oil has different RTH hours: 9:00-14:30 ET."""
+    et = pytz.timezone("US/Eastern")
+    mock_dt = et.localize(datetime(2026, 4, 13, 10, 0, 0))  # Monday 10:00 ET
+    with patch("market_bridge.tools.market_state.datetime") as mock_datetime:
+        mock_datetime.now.return_value = mock_dt
+        mock_datetime.strptime = datetime.strptime
+        state = compute_market_state("/CL")
+    assert state.session == MarketSession.RTH
+    assert state.is_open is True
+
+
+def test_cl_after_rth_close():
+    """/CL RTH closes at 14:30 ET — should be globex after that."""
+    et = pytz.timezone("US/Eastern")
+    mock_dt = et.localize(datetime(2026, 4, 13, 15, 0, 0))  # Monday 3:00 PM ET
+    with patch("market_bridge.tools.market_state.datetime") as mock_datetime:
+        mock_datetime.now.return_value = mock_dt
+        mock_datetime.strptime = datetime.strptime
+        state = compute_market_state("/CL")
+    assert state.session == MarketSession.GLOBEX
+    assert state.is_open is True
