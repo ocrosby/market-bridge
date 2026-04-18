@@ -6,6 +6,7 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "fastmcp>=2.0.0",
+    "pytz>=2026.1.post1",
 ]
 
 [dependency-groups]
