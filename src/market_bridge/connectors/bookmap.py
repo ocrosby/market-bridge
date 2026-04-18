@@ -32,10 +32,28 @@ class BookmapError(Exception):
 class BookmapConnector:
     def __init__(self, settings: BookmapSettings) -> None:
         self.settings = settings
+        self._file_cache: dict[str, tuple[float, object]] = {}
 
     @property
     def is_configured(self) -> bool:
         return self.settings.is_configured
+
+    def _is_stale(self, path: Path) -> bool:
+        """Check if the cached data for a file is stale."""
+        cached = self._file_cache.get(str(path))
+        if cached is None:
+            return True
+        cached_mtime, _ = cached
+        return path.stat().st_mtime > cached_mtime
+
+    def _get_cached(self, path: Path) -> object | None:
+        """Return cached result if file hasn't changed, else None."""
+        if self._is_stale(path):
+            return None
+        return self._file_cache[str(path)][1]
+
+    def _set_cached(self, path: Path, value: object) -> None:
+        self._file_cache[str(path)] = (path.stat().st_mtime, value)
 
     def _find_latest_file(self, pattern: str) -> Path | None:
         """Find the most recently modified file matching a glob pattern."""
@@ -66,7 +84,15 @@ class BookmapConnector:
             logger.info("No Bookmap heatmap export found in %s", self.settings.export_dir)
             return Heatmap(symbol=symbol)
 
-        return self._parse_heatmap_csv(path, symbol, depth)
+        cached = self._get_cached(path)
+        if cached is not None:
+            # Re-slice cached heatmap to requested depth
+            hm = cached
+            return Heatmap(symbol=symbol, bids=hm.bids[:depth], asks=hm.asks[:depth])
+
+        heatmap = self._parse_heatmap_csv(path, symbol, depth=50)  # cache with max depth
+        self._set_cached(path, heatmap)
+        return Heatmap(symbol=symbol, bids=heatmap.bids[:depth], asks=heatmap.asks[:depth])
 
     def _parse_heatmap_csv(self, path: Path, symbol: str, depth: int) -> Heatmap:
         bids: list[HeatmapLevel] = []
@@ -136,7 +162,13 @@ class BookmapConnector:
             logger.info("No Bookmap volume profile export found in %s", self.settings.export_dir)
             return VolumeProfile(symbol=symbol, session=session, lookback_days=lookback_days)
 
-        return self._parse_volume_csv(path, symbol, session, lookback_days)
+        cached = self._get_cached(path)
+        if cached is not None:
+            return cached
+
+        profile = self._parse_volume_csv(path, symbol, session, lookback_days)
+        self._set_cached(path, profile)
+        return profile
 
     def _parse_volume_csv(
         self, path: Path, symbol: str, session: str, lookback_days: int

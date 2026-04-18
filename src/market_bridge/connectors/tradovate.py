@@ -19,7 +19,7 @@ import websockets
 from websockets.asyncio.client import ClientConnection
 
 from market_bridge.config import TradovateSettings
-from market_bridge.models import Bar, DeltaBar, HeatmapLevel, Levels, VolumeNode
+from market_bridge.models import FUTURES_SESSIONS, Bar, DeltaBar, HeatmapLevel, Levels, VolumeNode
 
 logger = logging.getLogger(__name__)
 
@@ -301,7 +301,7 @@ class TradovateConnector:
                     price=float(entry.get("price", 0)),
                     size=int(entry.get("size", 0)),
                 ))
-            for entry in dom_data.get("offers", dom_data.get("asks", []))[:depth]:
+            for entry in (dom_data.get("offers") or dom_data.get("asks") or [])[:depth]:
                 asks.append(HeatmapLevel(
                     price=float(entry.get("price", 0)),
                     size=int(entry.get("size", 0)),
@@ -323,11 +323,12 @@ class TradovateConnector:
         if not bars:
             return Levels(symbol=symbol, session=session)
 
-        # Filter bars by session if needed
-        session_bars = bars  # TODO: filter by RTH/globex times
+        # Filter bars by session time window
+        session_bars = _filter_bars_by_session(bars, symbol, session)
 
-        prices = [b.close for b in session_bars]
-        volumes = [b.volume for b in session_bars]
+        if not session_bars:
+            session_bars = bars  # fall back to all bars if filter empties the list
+
         highs = [b.high for b in session_bars]
         lows = [b.low for b in session_bars]
 
@@ -475,9 +476,64 @@ def _tick_size(symbol: str) -> float:
     """Get tick size for a futures symbol."""
     tick_sizes = {
         "/ES": 0.25, "/NQ": 0.25, "/YM": 1.0, "/RTY": 0.10,
-        "/CL": 0.01, "/GC": 0.10, "/SI": 0.005, "/ZB": 1/32,
+        "/CL": 0.01, "/GC": 0.10, "/SI": 0.005,
+        "/ZB": 1 / 32, "/ZN": 1 / 64, "/ZF": 1 / 128,
+        "/6E": 0.00005, "/6J": 0.0000005,
     }
     return tick_sizes.get(symbol, 0.25)
+
+
+def _filter_bars_by_session(
+    bars: list[Bar], symbol: str, session: str
+) -> list[Bar]:
+    """Filter bars to only include those within the requested session window.
+
+    Args:
+        bars: List of bars with ISO timestamp strings.
+        symbol: Futures symbol (e.g. /ES) used to look up session times.
+        session: One of "rth", "globex", or "full".
+    """
+    if session == "full":
+        return bars
+
+    spec = FUTURES_SESSIONS.get(symbol)
+    if not spec:
+        return bars
+
+    rth_open_minutes = spec["rth_open"][0] * 60 + spec["rth_open"][1]
+    rth_close_minutes = spec["rth_close"][0] * 60 + spec["rth_close"][1]
+
+    filtered = []
+    for bar in bars:
+        bar_minutes = _bar_time_of_day_et(bar.timestamp)
+        if bar_minutes is None:
+            filtered.append(bar)  # keep bars we can't parse
+            continue
+
+        in_rth = rth_open_minutes <= bar_minutes < rth_close_minutes
+
+        if session == "rth" and in_rth:
+            filtered.append(bar)
+        elif session == "globex" and not in_rth:
+            filtered.append(bar)
+
+    return filtered
+
+
+def _bar_time_of_day_et(timestamp: str) -> int | None:
+    """Extract time-of-day in minutes (ET) from an ISO timestamp string.
+
+    Returns None if the timestamp can't be parsed.
+    """
+    try:
+        # Tradovate timestamps are typically UTC ISO format
+        dt = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+        # Convert UTC to ET (approximate: -4 for EDT, -5 for EST)
+        # Use -4 as EDT covers most trading days
+        et_hour = (dt.hour - 4) % 24
+        return et_hour * 60 + dt.minute
+    except (ValueError, AttributeError):
+        return None
 
 
 def _utc_now_iso() -> str:

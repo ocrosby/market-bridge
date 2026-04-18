@@ -654,6 +654,10 @@ gantt
 - [x] Implement `get_order_flow` tool (delta, cumulative delta)
 - [x] Add reconnection logic with exponential backoff for WebSocket drops
 - [x] Contract resolution (auto-resolve /ES to front-month contract)
+- [x] RTH/globex session filtering for level calculations
+- [x] 36 unit tests covering auth, contract resolution, bars, DOM, order flow, levels, session filtering, and helpers
+
+> **Note:** Order flow delta is approximated from OHLCV bar data, not true tick-level data. The WebSocket infrastructure supports tick streaming but is not yet connected to a live tick feed. True tick-level delta would require a streaming subscription, which is planned for a future release.
 
 ### Phase 3: Bookmap Integration (complete)
 - [x] Research Bookmap API — no public REST API; CSV export is the path
@@ -672,7 +676,7 @@ gantt
 - [x] Add TTL-based caching layer with configurable TTL and max entries
 - [x] Support multiple instruments (/ES, /NQ, /YM, /RTY, /CL, /GC, and more)
 - [x] Configuration via environment variables and `.env` file
-- [x] 52 comprehensive tests covering all modules
+- [x] 88 comprehensive tests covering all modules
 
 ---
 
@@ -722,7 +726,7 @@ This project follows [Conventional Commits](https://www.conventionalcommits.org/
 
 ### Do I need a Tradovate / Bookmap / TOS account?
 
-Eventually yes — the connectors will need API credentials to fetch data. During development, the tools return stub (placeholder) data so you can test the MCP integration without any trading account.
+Yes, to get real market data. Without credentials, the tools will still respond (they won't crash) but will return empty results with a message explaining which environment variables to set. This means you can verify the MCP integration works even without an account — you just won't see real data until you configure a data source.
 
 ### Does this execute trades?
 
