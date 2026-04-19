@@ -14,15 +14,12 @@ from __future__ import annotations
 import csv
 import logging
 from pathlib import Path
+from typing import Union
 
 from market_bridge.config import BookmapSettings
 from market_bridge.models import Heatmap, HeatmapLevel, VolumeNode, VolumeProfile
 
 logger = logging.getLogger(__name__)
-
-# Expected column names (case-insensitive matching)
-HEATMAP_COLUMNS = {"timestamp", "price", "bid_size", "ask_size"}
-VOLUME_COLUMNS = {"price", "volume"}
 
 
 class BookmapError(Exception):
@@ -32,7 +29,7 @@ class BookmapError(Exception):
 class BookmapConnector:
     def __init__(self, settings: BookmapSettings) -> None:
         self.settings = settings
-        self._file_cache: dict[str, tuple[float, object]] = {}
+        self._file_cache: dict[str, tuple[float, Union[Heatmap, VolumeProfile]]] = {}
 
     @property
     def is_configured(self) -> bool:
@@ -44,16 +41,29 @@ class BookmapConnector:
         if cached is None:
             return True
         cached_mtime, _ = cached
-        return path.stat().st_mtime > cached_mtime
+        try:
+            return path.stat().st_mtime > cached_mtime
+        except (FileNotFoundError, OSError):
+            del self._file_cache[str(path)]
+            return True
 
-    def _get_cached(self, path: Path) -> object | None:
-        """Return cached result if file hasn't changed, else None."""
+    def _get_cached_heatmap(self, path: Path) -> Heatmap | None:
         if self._is_stale(path):
             return None
-        return self._file_cache[str(path)][1]
+        value = self._file_cache[str(path)][1]
+        return value if isinstance(value, Heatmap) else None
 
-    def _set_cached(self, path: Path, value: object) -> None:
-        self._file_cache[str(path)] = (path.stat().st_mtime, value)
+    def _get_cached_profile(self, path: Path) -> VolumeProfile | None:
+        if self._is_stale(path):
+            return None
+        value = self._file_cache[str(path)][1]
+        return value if isinstance(value, VolumeProfile) else None
+
+    def _set_cached(self, path: Path, value: Heatmap | VolumeProfile) -> None:
+        try:
+            self._file_cache[str(path)] = (path.stat().st_mtime, value)
+        except (FileNotFoundError, OSError):
+            pass
 
     def _find_latest_file(self, pattern: str) -> Path | None:
         """Find the most recently modified file matching a glob pattern."""
@@ -67,14 +77,9 @@ class BookmapConnector:
         return files[0] if files else None
 
     def get_heatmap(self, symbol: str, depth: int = 10) -> Heatmap:
-        """Load heatmap data from the latest Bookmap export file.
-
-        Looks for files matching *heatmap*.csv or *{symbol}*heatmap*.csv
-        in the export directory.
-        """
+        """Load heatmap data from the latest Bookmap export file."""
         symbol_clean = symbol.lstrip("/").upper()
 
-        # Try symbol-specific file first, then any heatmap file
         path = (
             self._find_latest_file(f"*{symbol_clean}*heatmap*.csv")
             or self._find_latest_file("*heatmap*.csv")
@@ -84,13 +89,11 @@ class BookmapConnector:
             logger.info("No Bookmap heatmap export found in %s", self.settings.export_dir)
             return Heatmap(symbol=symbol)
 
-        cached = self._get_cached(path)
+        cached = self._get_cached_heatmap(path)
         if cached is not None:
-            # Re-slice cached heatmap to requested depth
-            hm = cached
-            return Heatmap(symbol=symbol, bids=hm.bids[:depth], asks=hm.asks[:depth])
+            return Heatmap(symbol=symbol, bids=cached.bids[:depth], asks=cached.asks[:depth])
 
-        heatmap = self._parse_heatmap_csv(path, symbol, depth=50)  # cache with max depth
+        heatmap = self._parse_heatmap_csv(path, symbol, depth=50)
         self._set_cached(path, heatmap)
         return Heatmap(symbol=symbol, bids=heatmap.bids[:depth], asks=heatmap.asks[:depth])
 
@@ -103,7 +106,6 @@ class BookmapConnector:
             if not reader.fieldnames:
                 return Heatmap(symbol=symbol)
 
-            # Normalize column names to lowercase
             col_map = {c.strip().lower(): c for c in reader.fieldnames}
 
             price_col = col_map.get("price")
@@ -114,7 +116,6 @@ class BookmapConnector:
                 logger.warning("Heatmap CSV missing expected columns: %s", reader.fieldnames)
                 return Heatmap(symbol=symbol)
 
-            # Read the latest rows (last snapshot), collect by price
             bid_map: dict[float, int] = {}
             ask_map: dict[float, int] = {}
 
@@ -132,7 +133,6 @@ class BookmapConnector:
                 except (ValueError, KeyError):
                     continue
 
-        # Sort bids descending (highest first), asks ascending (lowest first)
         sorted_bids = sorted(bid_map.items(), key=lambda x: x[0], reverse=True)
         sorted_asks = sorted(ask_map.items(), key=lambda x: x[0])
 
@@ -145,10 +145,7 @@ class BookmapConnector:
     def get_volume_profile(
         self, symbol: str, session: str, lookback_days: int
     ) -> VolumeProfile:
-        """Load volume profile from the latest Bookmap export file.
-
-        Looks for files matching *volume*.csv or *profile*.csv.
-        """
+        """Load volume profile from the latest Bookmap export file."""
         symbol_clean = symbol.lstrip("/").upper()
 
         path = (
@@ -162,7 +159,7 @@ class BookmapConnector:
             logger.info("No Bookmap volume profile export found in %s", self.settings.export_dir)
             return VolumeProfile(symbol=symbol, session=session, lookback_days=lookback_days)
 
-        cached = self._get_cached(path)
+        cached = self._get_cached_profile(path)
         if cached is not None:
             return cached
 
@@ -199,12 +196,10 @@ class BookmapConnector:
         if not nodes:
             return VolumeProfile(symbol=symbol, session=session, lookback_days=lookback_days)
 
-        # Compute POC, VAH, VAL from nodes
         total_vol = sum(n.volume for n in nodes)
         poc_node = max(nodes, key=lambda n: n.volume)
         poc = poc_node.price
 
-        # Value area (70% of volume)
         sorted_nodes = sorted(nodes, key=lambda n: n.price)
         poc_idx = next(i for i, n in enumerate(sorted_nodes) if n.price == poc)
         va_target = total_vol * 0.70
@@ -221,9 +216,11 @@ class BookmapConnector:
             elif hi_idx < len(sorted_nodes) - 1:
                 hi_idx += 1
                 va_vol += sorted_nodes[hi_idx].volume
-            else:
+            elif lo_idx > 0:
                 lo_idx -= 1
                 va_vol += sorted_nodes[lo_idx].volume
+            else:
+                break
 
         val = sorted_nodes[lo_idx].price
         vah = sorted_nodes[hi_idx].price

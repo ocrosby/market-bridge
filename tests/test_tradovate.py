@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -143,7 +144,7 @@ class TestGetBars:
     async def test_get_bars_parses_response(self):
         connector = _authed_connector()
         connector.find_contract = AsyncMock(return_value={"id": 42})
-        connector._api_get = AsyncMock(return_value={"bars": _sample_bars_raw()})
+        connector._ws_request = AsyncMock(return_value={"bars": _sample_bars_raw()})
 
         bars = await connector.get_bars("/ES", "1h", 10)
         assert len(bars) == 2
@@ -163,16 +164,25 @@ class TestGetBars:
             {"timestamp": f"t{i}", "open": 100, "high": 101, "low": 99, "close": 100, "volume": 1}
             for i in range(20)
         ]
-        connector._api_get = AsyncMock(return_value={"bars": many_bars})
+        connector._ws_request = AsyncMock(return_value={"bars": many_bars})
         bars = await connector.get_bars("/ES", "5m", 5)
         assert len(bars) == 5
 
     async def test_get_bars_empty_response(self):
         connector = _authed_connector()
         connector.find_contract = AsyncMock(return_value={"id": 42})
-        connector._api_get = AsyncMock(return_value={"bars": []})
+        connector._ws_request = AsyncMock(return_value={"bars": []})
         bars = await connector.get_bars("/ES", "1h", 10)
         assert bars == []
+
+    async def test_get_bars_uses_ws_endpoint(self):
+        connector = _authed_connector()
+        connector.find_contract = AsyncMock(return_value={"id": 42})
+        connector._ws_request = AsyncMock(return_value={"bars": []})
+        await connector.get_bars("/ES", "5m", 10)
+        connector._ws_request.assert_called_once()
+        call_args = connector._ws_request.call_args
+        assert call_args[0][0] == "md/getchart"
 
 
 # ── DOM ──────────────────────────────────────────────────────────────────
@@ -182,7 +192,7 @@ class TestGetDom:
     async def test_dom_with_offers_key(self):
         connector = _authed_connector()
         connector.find_contract = AsyncMock(return_value={"id": 42})
-        connector._api_get = AsyncMock(return_value={
+        connector._ws_request = AsyncMock(return_value={
             "bids": [{"price": 5400.0, "size": 500}],
             "offers": [{"price": 5401.0, "size": 300}],
         })
@@ -194,7 +204,7 @@ class TestGetDom:
     async def test_dom_with_asks_key(self):
         connector = _authed_connector()
         connector.find_contract = AsyncMock(return_value={"id": 42})
-        connector._api_get = AsyncMock(return_value={
+        connector._ws_request = AsyncMock(return_value={
             "bids": [{"price": 5400.0, "size": 500}],
             "asks": [{"price": 5401.0, "size": 300}],
         })
@@ -204,7 +214,7 @@ class TestGetDom:
     async def test_dom_empty_response(self):
         connector = _authed_connector()
         connector.find_contract = AsyncMock(return_value={"id": 42})
-        connector._api_get = AsyncMock(return_value={})
+        connector._ws_request = AsyncMock(return_value={})
         dom = await connector.get_dom("/ES", depth=5)
         assert dom["bids"] == []
         assert dom["asks"] == []
@@ -212,11 +222,19 @@ class TestGetDom:
     async def test_dom_neither_offers_nor_asks(self):
         connector = _authed_connector()
         connector.find_contract = AsyncMock(return_value={"id": 42})
-        connector._api_get = AsyncMock(return_value={
+        connector._ws_request = AsyncMock(return_value={
             "bids": [{"price": 5400, "size": 100}],
         })
         dom = await connector.get_dom("/ES", depth=5)
         assert dom["asks"] == []
+
+    async def test_dom_uses_ws_endpoint(self):
+        connector = _authed_connector()
+        connector.find_contract = AsyncMock(return_value={"id": 42})
+        connector._ws_request = AsyncMock(return_value={})
+        await connector.get_dom("/ES", depth=5)
+        call_args = connector._ws_request.call_args
+        assert call_args[0][0] == "md/subscribeDOM"
 
 
 # ── Order flow ───────────────────────────────────────────────────────────
@@ -364,6 +382,61 @@ class TestFilterBarsBySession:
 
 
 # ── Helper: volume profile computation ───────────────────────────────────
+
+
+class TestWsFrameParser:
+    def test_parse_response_frame(self):
+        """Test parsing Tradovate JSON array response frame."""
+        connector = _authed_connector()
+        loop = asyncio.get_event_loop()
+        future = loop.create_future()
+        connector._ws_responses[1] = future
+
+        connector._handle_ws_message('a[{"s":200,"i":1,"d":{"price":5400}}]')
+        assert future.done()
+        assert future.result() == {"price": 5400}
+
+    def test_parse_error_response(self):
+        connector = _authed_connector()
+        loop = asyncio.get_event_loop()
+        future = loop.create_future()
+        connector._ws_responses[1] = future
+
+        connector._handle_ws_message('a[{"s":400,"i":1,"d":{}}]')
+        assert future.done()
+        with pytest.raises(TradovateError):
+            future.result()
+
+    def test_heartbeat_ignored(self):
+        connector = _authed_connector()
+        connector._handle_ws_message("h")  # should not raise
+
+    def test_empty_message_ignored(self):
+        connector = _authed_connector()
+        connector._handle_ws_message("")  # should not raise
+
+    def test_malformed_json_ignored(self):
+        connector = _authed_connector()
+        connector._handle_ws_message("a{not json}")  # should not raise
+
+
+class TestCancelPendingFutures:
+    def test_cancels_all_futures(self):
+        connector = _authed_connector()
+        loop = asyncio.get_event_loop()
+        f1 = loop.create_future()
+        f2 = loop.create_future()
+        connector._ws_responses[1] = f1
+        connector._ws_responses[2] = f2
+
+        connector._cancel_pending_futures("test disconnect")
+        assert f1.done()
+        assert f2.done()
+        assert connector._ws_responses == {}
+        with pytest.raises(TradovateError):
+            f1.result()
+        with pytest.raises(TradovateError):
+            f2.result()
 
 
 class TestComputeVolumeProfile:

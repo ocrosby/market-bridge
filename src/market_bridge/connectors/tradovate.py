@@ -1,7 +1,9 @@
 """Tradovate REST + WebSocket API connector.
 
-Handles OAuth2 authentication, token renewal, and market data retrieval
-via both REST and WebSocket APIs.
+Handles OAuth2 authentication, token renewal, and market data retrieval.
+
+- REST API: authentication, contract resolution, account data
+- WebSocket API: market data (charts, DOM, quotes)
 
 Reference: https://api.tradovate.com/
 """
@@ -76,6 +78,7 @@ class TradovateConnector:
         self._ws_counter: int = 0
         self._ws_responses: dict[int, asyncio.Future] = {}
         self._ws_listener_task: asyncio.Task | None = None
+        self._ws_lock = asyncio.Lock()
         self._reconnect_attempts: int = 0
         self._max_reconnect_attempts: int = 5
         self._reconnect_delay: float = 1.0
@@ -121,7 +124,6 @@ class TradovateConnector:
             raise TradovateError(f"Authentication error: {data['errorText']}")
 
         self.access_token = data["accessToken"]
-        # Tokens last ~80 minutes; refresh at 70 minutes
         self.token_expiry = time.monotonic() + 70 * 60
         logger.info("Tradovate authentication successful")
 
@@ -167,16 +169,24 @@ class TradovateConnector:
 
     # ── WebSocket connection ─────────────────────────────────────────────
 
-    async def connect_market_data(self) -> None:
-        """Connect to the Tradovate market data WebSocket."""
-        await self._ensure_authenticated()
-        await self._ws_connect()
+    async def _ensure_ws_connected(self) -> None:
+        """Ensure a WebSocket connection exists, creating one if needed.
+
+        Uses a lock to prevent concurrent callers from creating duplicate
+        connections.
+        """
+        if self._ws is not None:
+            return
+        async with self._ws_lock:
+            if self._ws is not None:
+                return  # another coroutine connected while we waited
+            await self._ensure_authenticated()
+            await self._ws_connect()
 
     async def _ws_connect(self) -> None:
         ws = None
         try:
             ws = await websockets.connect(self.settings.md_url)
-            # Authorize the WebSocket connection
             await ws.send(f"authorize\n{self._next_id()}\n\n{self.access_token}")
             auth_response = await ws.recv()
             logger.info("Market data WebSocket connected: %s", str(auth_response)[:100])
@@ -195,57 +205,108 @@ class TradovateConnector:
                 self._handle_ws_message(str(message))
         except websockets.exceptions.ConnectionClosed:
             logger.warning("WebSocket connection closed")
+            self._cancel_pending_futures("WebSocket connection lost")
+            self._ws = None
             await self._ws_reconnect()
 
     def _handle_ws_message(self, message: str) -> None:
+        """Parse Tradovate WebSocket frames.
+
+        Tradovate sends frames in these formats:
+          - Heartbeat: single character 'h' or empty
+          - Response: 'a' followed by JSON array of response objects
+            e.g. a[{"s":200,"i":1,"d":{...}}]
+            where "i" is the request ID, "s" is status, "d" is data
+          - Data push: 'd' followed by JSON object (chart data, etc.)
+        """
         if not message:
             return
 
-        # Handle heartbeat
         if message.startswith("h"):
             return
 
-        # Handle framed responses (a = response to a request)
+        # Response frame: a[{...}]
         if message.startswith("a"):
             try:
-                lines = message.split("\n", 2)
-                if len(lines) >= 1:
-                    req_id_str = lines[0][1:].strip("[]")
-                    if req_id_str.isdigit():
-                        req_id = int(req_id_str)
-                        body = lines[2] if len(lines) > 2 else "{}"
-                        future = self._ws_responses.get(req_id)
-                        if future and not future.done():
-                            future.set_result(json.loads(body) if body.strip() else {})
+                payload = json.loads(message[1:])
+                if isinstance(payload, list):
+                    for item in payload:
+                        if not isinstance(item, dict):
+                            continue
+                        req_id = item.get("i")
+                        if req_id is not None:
+                            future = self._ws_responses.get(req_id)
+                            if future and not future.done():
+                                status = item.get("s", 200)
+                                if status == 200:
+                                    future.set_result(item.get("d", {}))
+                                else:
+                                    future.set_exception(
+                                        TradovateError(f"WS request {req_id} failed: status {status}")
+                                    )
             except (ValueError, json.JSONDecodeError) as e:
-                logger.debug("Could not parse WebSocket message: %s", e)
+                logger.debug("Could not parse WebSocket response frame: %s", e)
+            return
+
+        # Data push frame: d{...} (chart updates, quote updates)
+        if message.startswith("d"):
+            try:
+                payload = json.loads(message[1:])
+                self._handle_data_push(payload)
+            except (ValueError, json.JSONDecodeError) as e:
+                logger.debug("Could not parse WebSocket data frame: %s", e)
+
+    def _handle_data_push(self, data: dict) -> None:
+        """Handle incoming data push from WebSocket (chart bars, quotes, etc.).
+
+        Chart data pushes contain a "charts" key with bar arrays.
+        We route these to any pending chart request future.
+        """
+        if "charts" in data:
+            for chart in data["charts"]:
+                req_id = chart.get("id")
+                if req_id is not None:
+                    future = self._ws_responses.get(req_id)
+                    if future and not future.done():
+                        future.set_result(chart)
+
+    def _cancel_pending_futures(self, reason: str) -> None:
+        """Cancel all pending WebSocket request futures on disconnect."""
+        for req_id, future in list(self._ws_responses.items()):
+            if not future.done():
+                future.set_exception(TradovateError(reason))
+        self._ws_responses.clear()
 
     async def _ws_reconnect(self) -> None:
         """Reconnect WebSocket with exponential backoff (iterative, bounded)."""
-        while self._reconnect_attempts < self._max_reconnect_attempts:
-            self._reconnect_attempts += 1
-            delay = self._reconnect_delay * (2 ** (self._reconnect_attempts - 1))
-            logger.info("Reconnecting WebSocket in %.1fs (attempt %d/%d)",
-                        delay, self._reconnect_attempts, self._max_reconnect_attempts)
-            await asyncio.sleep(delay)
+        async with self._ws_lock:
+            while self._reconnect_attempts < self._max_reconnect_attempts:
+                self._reconnect_attempts += 1
+                delay = self._reconnect_delay * (2 ** (self._reconnect_attempts - 1))
+                logger.info("Reconnecting WebSocket in %.1fs (attempt %d/%d)",
+                            delay, self._reconnect_attempts, self._max_reconnect_attempts)
+                await asyncio.sleep(delay)
 
-            try:
-                await self._ensure_authenticated()
-                await self._ws_connect()
-                return  # success
-            except Exception as e:
-                logger.error("Reconnection attempt %d failed: %s", self._reconnect_attempts, e)
+                try:
+                    await self._ensure_authenticated()
+                    await self._ws_connect()
+                    return
+                except Exception as e:
+                    logger.error("Reconnection attempt %d failed: %s", self._reconnect_attempts, e)
 
-        logger.error("Max WebSocket reconnect attempts (%d) reached, giving up",
-                      self._max_reconnect_attempts)
+            logger.error("Max WebSocket reconnect attempts (%d) reached, giving up",
+                          self._max_reconnect_attempts)
 
     def _next_id(self) -> int:
         self._ws_counter += 1
         return self._ws_counter
 
     async def _ws_request(self, url: str, body: dict, timeout: float = 10.0) -> dict:
-        if not self._ws:
-            await self.connect_market_data()
+        """Send a request over the WebSocket and wait for the response."""
+        await self._ensure_ws_connected()
+
+        if self._ws is None:
+            raise TradovateError("WebSocket is not connected")
 
         req_id = self._next_id()
         future: asyncio.Future = asyncio.get_running_loop().create_future()
@@ -262,10 +323,10 @@ class TradovateConnector:
         finally:
             self._ws_responses.pop(req_id, None)
 
-    # ── Data fetching (REST-based fallback) ──────────────────────────────
+    # ── Market data (via WebSocket) ──────────────────────────────────────
 
     async def get_bars(self, symbol: str, timeframe: str, count: int) -> list[Bar]:
-        """Fetch historical OHLCV bars for a symbol."""
+        """Fetch historical OHLCV bars for a symbol via WebSocket."""
         contract = await self.find_contract(symbol)
         contract_id = contract.get("id") or contract.get("contractId")
 
@@ -273,45 +334,50 @@ class TradovateConnector:
         if not chart_desc:
             raise TradovateError(f"Unsupported timeframe: {timeframe}")
 
-        # Use REST endpoint for historical bars
-        bars_data = await self._api_get(
-            "/md/getChart",
-            {
-                "contractId": contract_id,
-                "chartDescription": json.dumps({
-                    "underlyingType": chart_desc["underlyingType"],
-                    "elementSize": chart_desc["elementSize"],
-                    "elementSizeUnit": chart_desc["elementSizeUnit"],
-                    "withHistogram": False,
-                }),
-                "timeRange": json.dumps({"asFarAsTimestamp": _utc_now_iso(), "closestTickCount": count}),
+        chart_request = {
+            "symbol": contract_id,
+            "chartDescription": {
+                "underlyingType": chart_desc["underlyingType"],
+                "elementSize": chart_desc["elementSize"],
+                "elementSizeUnit": chart_desc["elementSizeUnit"],
+                "withHistogram": False,
             },
-        )
+            "timeRange": {
+                "asFarAsTimestamp": _utc_now_iso(),
+                "closestTickCount": count,
+            },
+        }
+
+        chart_data = await self._ws_request("md/getchart", chart_request, timeout=15.0)
 
         bars = []
-        raw_bars = bars_data.get("bars", bars_data) if isinstance(bars_data, dict) else bars_data
-        if isinstance(raw_bars, list):
-            for b in raw_bars[-count:]:
-                bars.append(Bar(
-                    timestamp=b.get("timestamp", ""),
-                    open=float(b.get("open", 0)),
-                    high=float(b.get("high", 0)),
-                    low=float(b.get("low", 0)),
-                    close=float(b.get("close", 0)),
-                    volume=int(b.get("volume", 0)),
-                ))
-        else:
+        raw_bars = chart_data.get("bars", []) if isinstance(chart_data, dict) else []
+        if not isinstance(raw_bars, list):
             logger.warning("Unexpected bar data structure from Tradovate: %s", type(raw_bars).__name__)
+            return []
+
+        for b in raw_bars[-count:]:
+            bars.append(Bar(
+                timestamp=b.get("timestamp", ""),
+                open=float(b.get("open", 0)),
+                high=float(b.get("high", 0)),
+                low=float(b.get("low", 0)),
+                close=float(b.get("close", 0)),
+                volume=int(b.get("volume", 0)),
+            ))
         return bars
 
     async def get_dom(self, symbol: str, depth: int = 10) -> dict:
-        """Fetch current depth of market (DOM) for a symbol."""
+        """Fetch current depth of market (DOM) for a symbol via WebSocket."""
         contract = await self.find_contract(symbol)
         contract_id = contract.get("id") or contract.get("contractId")
 
-        dom_data = await self._api_get("/md/dom", {"contractId": contract_id})
-        bids = []
-        asks = []
+        dom_data = await self._ws_request(
+            "md/subscribeDOM", {"symbol": contract_id}, timeout=10.0
+        )
+
+        bids: list[HeatmapLevel] = []
+        asks: list[HeatmapLevel] = []
         if isinstance(dom_data, dict):
             for entry in dom_data.get("bids", [])[:depth]:
                 bids.append(HeatmapLevel(
@@ -326,25 +392,25 @@ class TradovateConnector:
         return {"bids": bids, "asks": asks}
 
     async def get_quote(self, symbol: str) -> dict:
-        """Fetch the latest quote for a symbol."""
+        """Fetch the latest quote for a symbol via WebSocket."""
         contract = await self.find_contract(symbol)
         contract_id = contract.get("id") or contract.get("contractId")
-        return await self._api_get("/md/quote", {"contractId": contract_id})
+        return await self._ws_request(
+            "md/subscribeQuote", {"symbol": contract_id}, timeout=10.0
+        )
 
     # ── Derived data ─────────────────────────────────────────────────────
 
     async def compute_levels(self, symbol: str, session: str) -> Levels:
         """Compute session levels from historical bar data."""
-        # Fetch enough bars to cover the session
         bars = await self.get_bars(symbol, "5m", 200)
         if not bars:
             return Levels(symbol=symbol, session=session)
 
-        # Filter bars by session time window
         session_bars = _filter_bars_by_session(bars, symbol, session)
 
         if not session_bars:
-            session_bars = bars  # fall back to all bars if filter empties the list
+            session_bars = bars
 
         highs = [b.high for b in session_bars]
         lows = [b.low for b in session_bars]
@@ -352,7 +418,6 @@ class TradovateConnector:
         session_high = max(highs) if highs else None
         session_low = min(lows) if lows else None
 
-        # Compute volume profile from bars
         vpoc, vah, val, hvns, lvns = _compute_volume_profile(session_bars, symbol)
 
         return Levels(
@@ -370,7 +435,7 @@ class TradovateConnector:
     async def compute_order_flow(
         self, symbol: str, timeframe: str, count: int
     ) -> list[DeltaBar]:
-        """Compute order flow delta from tick/bar data.
+        """Compute order flow delta from bar data.
 
         Note: True tick-level delta requires tick data streaming.
         This approximation uses bar data with up/down volume estimation.
@@ -381,7 +446,6 @@ class TradovateConnector:
         min_range = tick_size(symbol)
         for bar in bars:
             bar_range = max(bar.high - bar.low, min_range)
-            # Approximate: if close > open, more buying; if close < open, more selling
             if bar.close >= bar.open:
                 buy_pct = 0.5 + 0.5 * min((bar.close - bar.open) / bar_range, 1.0)
             else:
@@ -405,15 +469,13 @@ class TradovateConnector:
         self, symbol: str, session: str, lookback_days: int
     ) -> tuple[list[VolumeNode], float | None, float | None, float | None]:
         """Compute volume profile from bar data."""
-        # Use small timeframe bars for better resolution
-        bars_needed = lookback_days * 78 * 5  # ~78 5-min bars per RTH session, 5 for safety
+        bars_needed = lookback_days * 78 * 5
         bars = await self.get_bars(symbol, "5m", min(bars_needed, 500))
         if not bars:
             return [], None, None, None
 
         vpoc, vah, val, _, _ = _compute_volume_profile(bars, symbol)
 
-        # Build node list
         price_vol: dict[float, int] = {}
         tick = tick_size(symbol)
         for bar in bars:
@@ -426,8 +488,10 @@ class TradovateConnector:
     async def close(self) -> None:
         if self._ws_listener_task:
             self._ws_listener_task.cancel()
+        self._cancel_pending_futures("Connector closing")
         if self._ws:
             await self._ws.close()
+            self._ws = None
         if self._http:
             await self._http.aclose()
 
@@ -443,7 +507,6 @@ def _compute_volume_profile(
     if not bars:
         return None, None, None, [], []
 
-    # Build price -> volume map using close prices binned to tick size
     tick = tick_size(symbol)
     price_vol: dict[float, int] = {}
     total_vol = 0
@@ -456,10 +519,8 @@ def _compute_volume_profile(
     if not price_vol:
         return None, None, None, [], []
 
-    # POC: price with highest volume
     poc = max(price_vol, key=price_vol.get)
 
-    # Value Area: 70% of volume centered on POC
     sorted_prices = sorted(price_vol.keys())
     poc_idx = sorted_prices.index(poc)
     va_target = total_vol * 0.70
@@ -477,14 +538,15 @@ def _compute_volume_profile(
         elif hi_idx < len(sorted_prices) - 1:
             hi_idx += 1
             va_vol += price_vol[sorted_prices[hi_idx]]
-        else:
+        elif lo_idx > 0:
             lo_idx -= 1
             va_vol += price_vol[sorted_prices[lo_idx]]
+        else:
+            break
 
     val = sorted_prices[lo_idx]
     vah = sorted_prices[hi_idx]
 
-    # HVN/LVN: prices with volume > 1.5x or < 0.5x average
     avg_vol = total_vol / len(price_vol)
     hvns = [p for p, v in price_vol.items() if v > avg_vol * 1.5]
     lvns = [p for p, v in price_vol.items() if v < avg_vol * 0.5]
@@ -510,7 +572,7 @@ def _filter_bars_by_session(
     for bar in bars:
         bar_minutes = _bar_time_of_day_et(bar.timestamp)
         if bar_minutes is None:
-            filtered.append(bar)  # keep bars we can't parse
+            filtered.append(bar)
             continue
 
         in_rth = rth_open_minutes <= bar_minutes < rth_close_minutes

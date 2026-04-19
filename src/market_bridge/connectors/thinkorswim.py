@@ -67,7 +67,11 @@ class ThinkorswimConnector:
         if cached is None:
             return True
         cached_mtime, _ = cached
-        return path.stat().st_mtime > cached_mtime
+        try:
+            return path.stat().st_mtime > cached_mtime
+        except (FileNotFoundError, OSError):
+            self._file_cache.pop(str(path), None)
+            return True
 
     def get_price_bars(self, symbol: str, count: int = 50) -> list[Bar]:
         """Load OHLCV bars from a TOS price export CSV."""

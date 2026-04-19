@@ -1,4 +1,5 @@
 import logging
+import sys
 
 from fastmcp import FastMCP
 
@@ -18,7 +19,8 @@ logger = logging.getLogger(__name__)
 
 def _create_server() -> FastMCP:
     """Create and configure the MCP server with all tools and connectors."""
-    from market_bridge.config import settings
+    from market_bridge.config import get_settings
+    settings = get_settings()
 
     server = FastMCP("Market Bridge")
 
@@ -41,13 +43,18 @@ def _create_server() -> FastMCP:
     return server
 
 
+# Configure logging before server init so errors are visible
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
+)
+
 try:
     mcp = _create_server()
 except Exception as e:
-    logger.error("Failed to initialize Market Bridge: %s", e)
-    # Create a bare server so the module still imports (for tests with bad env)
-    mcp = FastMCP("Market Bridge")
+    logger.critical("Failed to initialize Market Bridge: %s", e, exc_info=True)
+    sys.exit(1)
 
 
-def main():
+def main() -> None:
     mcp.run()

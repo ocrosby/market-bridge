@@ -72,4 +72,6 @@ class Settings(BaseSettings):
     cache: CacheSettings = Field(default_factory=CacheSettings)
 
 
-settings = Settings()
+def get_settings() -> Settings:
+    """Create settings from environment variables and .env file."""
+    return Settings()
