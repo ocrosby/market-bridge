@@ -301,6 +301,281 @@ If all tests pass, Market Bridge is installed correctly.
 
 ---
 
+## Platform Setup
+
+Market Bridge needs credentials or export directories from your trading platforms. You only need to set up the platforms you use — you don't need all three.
+
+### Step 1: Create your `.env` file
+
+In the `market-bridge` directory, copy the example file:
+
+```bash
+cp .env.example .env
+```
+
+Then open `.env` in any text editor and fill in the values for the platforms you use (see below).
+
+---
+
+### Tradovate (Real-Time API)
+
+Tradovate provides real-time market data through a REST + WebSocket API. This is the primary and most capable data source.
+
+#### 1. Create a Tradovate account
+
+1. Go to [tradovate.com](https://www.tradovate.com/) and click **Open Account**
+2. Choose a plan — a **demo/simulation account** works fine for Market Bridge
+3. Complete the registration and verify your email
+
+#### 2. Create API credentials
+
+Tradovate requires an API application to access their data programmatically:
+
+1. Log in to [trader.tradovate.com](https://trader.tradovate.com/)
+2. Go to **Settings** (gear icon) > **API Access**
+3. Click **Request API Access** if you haven't already — Tradovate may take 1-2 business days to approve
+4. Once approved, go to **API Access** > **Manage API Keys**
+5. Click **+ New API Key** and fill in:
+   - **App Name**: `Market Bridge` (or any name you like)
+   - **App Version**: `1.0`
+6. After creating the key, you'll receive:
+   - **Client ID** (a number) — this is your `CID`
+   - **Client Secret** — this is your `SEC`
+   - **App ID** — this is your `APP_ID`
+
+> **Important:** Copy the Client Secret immediately — Tradovate only shows it once.
+
+#### 3. Add credentials to your `.env` file
+
+```env
+TRADOVATE_USERNAME=your_tradovate_username
+TRADOVATE_PASSWORD=your_tradovate_password
+TRADOVATE_APP_ID=YourAppName
+TRADOVATE_APP_VERSION=1.0
+TRADOVATE_CID=12345
+TRADOVATE_SEC=your-client-secret-here
+TRADOVATE_DEMO=true
+```
+
+| Variable | What it is | Where to find it |
+|----------|-----------|-----------------|
+| `TRADOVATE_USERNAME` | Your Tradovate login username | The email/username you registered with |
+| `TRADOVATE_PASSWORD` | Your Tradovate login password | The password you set during registration |
+| `TRADOVATE_APP_ID` | The name of your API application | API Access > Manage API Keys |
+| `TRADOVATE_APP_VERSION` | Version string (just use `1.0`) | You chose this when creating the key |
+| `TRADOVATE_CID` | Client ID (numeric) | Shown after creating the API key |
+| `TRADOVATE_SEC` | Client Secret | Shown once after creating the API key |
+| `TRADOVATE_DEMO` | `true` for demo/sim, `false` for live | Set to `true` while testing |
+
+> **Demo vs Live:** Set `TRADOVATE_DEMO=true` to use Tradovate's simulation environment. This gives you delayed/simulated data without risking real money. Set to `false` only when you're ready to use your live funded account.
+
+#### 4. Verify it works
+
+Start Market Bridge and ask Claude: *"What's the current /ES market state?"*
+
+If Tradovate is configured correctly, the response will show `"source": "tradovate"` instead of `"source": "none"`.
+
+```mermaid
+graph LR
+    A[Create Tradovate Account] --> B[Request API Access]
+    B --> C[Create API Key]
+    C --> D[Copy CID + Secret]
+    D --> E[Add to .env file]
+    E --> F[Start Market Bridge]
+
+    style A fill:#577590,color:#fff
+    style F fill:#43aa8b,color:#fff
+```
+
+---
+
+### Bookmap (Heatmap & Volume Data)
+
+Bookmap provides the best liquidity heatmap and volume profile data. Market Bridge reads CSV files that Bookmap exports — there is no live API connection.
+
+#### 1. Install Bookmap
+
+1. Go to [bookmap.com](https://bookmap.com/) and create an account
+2. Download and install **Bookmap** for your platform (Windows or macOS)
+3. You need at least the **Digital** plan for data exports (the free version does not support exports)
+
+#### 2. Connect Bookmap to a data source
+
+Bookmap needs a data feed. You can connect it to:
+
+- **Tradovate** (if you have a Tradovate account — recommended)
+- **Rithmic** or **CQG** (other futures data providers)
+
+In Bookmap: **Connection** > **Connect to** > choose your provider and enter your credentials.
+
+#### 3. Export heatmap data
+
+Once Bookmap is running with live or recorded data:
+
+1. Open a chart for your instrument (e.g., ES)
+2. Go to **Tools** > **Export Heatmap Data**
+3. Choose an export directory (e.g., `~/Documents/Bookmap/exports`)
+4. Click **Export** — Bookmap saves a CSV file with bid/ask depth data
+
+For volume profile data:
+1. Right-click the volume profile indicator on your chart
+2. Select **Export** > **Export to CSV**
+3. Save to the same export directory
+
+#### 4. Configure the export directory
+
+If you saved your exports to the default location (`~/Documents/Bookmap/exports`), Market Bridge will find them automatically. If you used a different directory, add it to your `.env`:
+
+```env
+BOOKMAP_EXPORT_DIR=/Users/yourname/Documents/Bookmap/exports
+```
+
+> **Note:** Use an absolute path. Don't use `~` — it may not expand correctly in all environments.
+
+#### 5. File naming
+
+Market Bridge looks for files matching these patterns in your export directory:
+
+| Data Type | File Pattern | Example |
+|-----------|-------------|---------|
+| Heatmap | `*heatmap*.csv` or `*ES*heatmap*.csv` | `ES_heatmap_20260418.csv` |
+| Volume Profile | `*volume*.csv` or `*profile*.csv` | `ES_volume_profile.csv` |
+
+You can re-export files at any time — Market Bridge always reads the most recently modified file.
+
+```mermaid
+graph LR
+    A[Install Bookmap] --> B[Connect Data Feed]
+    B --> C[Open /ES Chart]
+    C --> D["Tools > Export Heatmap Data"]
+    D --> E[CSV saved to export dir]
+    E --> F[Market Bridge reads CSV]
+
+    style A fill:#577590,color:#fff
+    style F fill:#43aa8b,color:#fff
+```
+
+---
+
+### Thinkorswim (CSV Export Fallback)
+
+Thinkorswim (TOS) by Charles Schwab is a popular trading platform. Market Bridge reads CSV files exported from TOS thinkScript studies. This is the simplest setup but provides the least real-time data.
+
+#### 1. Get a Thinkorswim account
+
+1. Go to [schwab.com/trading/thinkorswim](https://www.schwab.com/trading/thinkorswim)
+2. Open a **Schwab brokerage account** (required to use TOS)
+3. Download and install **thinkorswim** desktop application
+4. Log in with your Schwab credentials
+
+> **Tip:** You can use TOS in **paperMoney** mode (simulated trading) — no need to fund the account for Market Bridge to work.
+
+#### 2. Export price data from a chart
+
+1. Open thinkorswim and navigate to the **Charts** tab
+2. Open a chart for `/ES` (type `/ES` in the symbol field)
+3. Set your desired timeframe (e.g., 5 min, 15 min, 1 hour)
+4. Right-click anywhere on the chart
+5. Select **Export Chart Data** > **Export to CSV**
+6. Save the file with a descriptive name in your export directory
+
+**Recommended file naming:**
+- `ES_price.csv` — price/OHLCV data for /ES
+- `NQ_price.csv` — price data for /NQ
+
+#### 3. Export custom study data (optional)
+
+If you have thinkScript studies that compute custom indicators:
+
+1. Open the **Studies** settings on your chart
+2. Select the study you want to export
+3. Click **Export Study** or use the study's built-in export function
+4. Save to your export directory
+
+#### 4. Configure the export directory
+
+If you saved your exports to the default location (`~/Documents/thinkorswim/exports`), Market Bridge will find them automatically. Otherwise, add it to your `.env`:
+
+```env
+TOS_EXPORT_DIR=/Users/yourname/Documents/thinkorswim/exports
+```
+
+#### 5. File naming
+
+Market Bridge looks for files matching these patterns:
+
+| Data Type | File Pattern | Example |
+|-----------|-------------|---------|
+| Price/OHLCV | `*ES*price*.csv` or `*ES*.csv` | `ES_price.csv` |
+| Volume Profile | Built from price data | (computed automatically) |
+
+> **Important:** TOS data is static — Market Bridge reads whatever CSV you last exported. To get fresh data, you need to re-export from TOS. Unlike Tradovate, there is no live connection.
+
+#### 6. Supported CSV formats
+
+Market Bridge handles both comma-separated and tab-separated files. The following column headers are recognized (case-insensitive):
+
+| Column | Aliases |
+|--------|---------|
+| Date/Time | `datetime`, `date`, `time`, `timestamp` |
+| Open | `open` |
+| High | `high` |
+| Low | `low` |
+| Close | `close`, `last` |
+| Volume | `volume`, `vol` |
+
+Date formats supported: `YYYY-MM-DD HH:MM`, `MM/DD/YYYY HH:MM`, and variants with seconds.
+
+```mermaid
+graph LR
+    A[Open Thinkorswim] --> B[Chart /ES]
+    B --> C[Right-click > Export CSV]
+    C --> D[Save to export dir]
+    D --> E[Market Bridge reads CSV]
+
+    style A fill:#577590,color:#fff
+    style E fill:#43aa8b,color:#fff
+```
+
+---
+
+### Platform Comparison
+
+```mermaid
+graph TB
+    subgraph Best["Best: Real-Time API"]
+        TV["Tradovate\n✓ Live streaming\n✓ All 6 tools\n✓ Auto-updates"]
+    end
+    subgraph Good["Good: CSV Export"]
+        BM["Bookmap\n✓ Best heatmap data\n✓ Volume profile\n✗ Manual export"]
+    end
+    subgraph Basic["Basic: CSV Fallback"]
+        TOS["Thinkorswim\n✓ Free with Schwab\n✓ Price data\n✗ Manual export"]
+    end
+
+    TV --> |preferred| MB[Market Bridge]
+    BM --> |heatmap/volume| MB
+    TOS --> |fallback| MB
+
+    style TV fill:#43aa8b,color:#fff
+    style BM fill:#f8961e,color:#fff
+    style TOS fill:#f94144,color:#fff
+    style MB fill:#577590,color:#fff
+```
+
+| Feature | Tradovate | Bookmap | Thinkorswim |
+|---------|-----------|---------|-------------|
+| Setup difficulty | Medium (API key required) | Medium (export workflow) | Easy (just export CSV) |
+| Data freshness | Real-time (WebSocket) | Manual (re-export needed) | Manual (re-export needed) |
+| Price data | Yes | No | Yes |
+| Volume profile | Yes (computed) | Yes (best quality) | Yes (computed) |
+| Order flow / delta | Yes (approximated) | No | No |
+| Heatmap / DOM | Yes (live DOM) | Yes (best quality) | No |
+| Market state | Yes | No | No |
+| Cost | Free (demo) / paid (live) | Paid (Digital plan+) | Free (with Schwab account) |
+
+---
+
 ## Configuration
 
 ### Using with Claude Code
