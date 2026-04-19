@@ -307,13 +307,50 @@ Market Bridge needs credentials or export directories from your trading platform
 
 ### Step 1: Create your `.env` file
 
-In the `market-bridge` directory, copy the example file:
+The `.env` file is where Market Bridge reads your credentials and settings. It is never committed to git (it's in `.gitignore`), so your passwords stay on your machine.
+
+**Create it by copying the example file:**
 
 ```bash
 cp .env.example .env
 ```
 
-Then open `.env` in any text editor and fill in the values for the platforms you use (see below).
+**Then open it in a text editor and fill in your values.** Here are a few ways to open it:
+
+```bash
+# macOS — opens in TextEdit
+open .env
+
+# macOS — opens in VS Code (if installed)
+code .env
+
+# Windows — opens in Notepad
+notepad .env
+
+# Linux — opens in nano (terminal editor)
+nano .env
+```
+
+The file is organized into sections for each platform. Each variable has a comment above it explaining what it is and where to find the value. Here's what a filled-in Tradovate section looks like:
+
+```env
+TRADOVATE_USERNAME=john.doe@example.com
+TRADOVATE_PASSWORD=MySecurePassword123
+TRADOVATE_APP_ID=MarketBridge
+TRADOVATE_APP_VERSION=1.0
+TRADOVATE_CID=8472
+TRADOVATE_SEC=a1b2c3d4-e5f6-7890-abcd-ef1234567890
+TRADOVATE_DEMO=true
+```
+
+For Bookmap and TOS, you only need to set the export directory path if it's different from the default:
+
+```env
+BOOKMAP_EXPORT_DIR=/Users/john/Documents/Bookmap/exports
+TOS_EXPORT_DIR=/Users/john/Documents/thinkorswim/exports
+```
+
+> **Leave variables blank** for platforms you don't use. Market Bridge will skip any platform that isn't configured and only use the ones with valid credentials/paths.
 
 ---
 
